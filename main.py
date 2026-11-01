@@ -84,6 +84,7 @@ def load_vulnerability_reports(report_file):
             reports = []
             for report_data in reports_data:
                 try:
+                    # Every field comes from a get with no default beyond None, and building this object cannot really fail, so the error log below almost never fires. A report entry missing its score or its dependency list loads happily and only breaks, or quietly matches nothing, further down.
                     report = VulnerabilityReport(
                         report_data.get('cve_id'),
                         report_data.get('description'),
@@ -155,6 +156,7 @@ def analyze_vulnerabilities(vulnerability_reports, dependency_graph):
     for report in vulnerability_reports:
         vulnerable_components = []
         for dependency in report.affected_dependencies:
+            # Matching is by name alone. I never compare the version in my graph against any version range, because the reports carry no range field, so a dependency that was patched long ago still lands in the result as long as its name appears in a report. A reader has to do the version judgement by eye from the output.
             if dependency in dependency_graph.dependencies:
                 vulnerable_components.append({
                     "dependency_name": dependency,
@@ -163,6 +165,7 @@ def analyze_vulnerabilities(vulnerability_reports, dependency_graph):
                 })
 
         if vulnerable_components:
+            # Two reports carrying the same CVE id overwrite each other here, last one wins. A feed that splits one CVE across several entries loses all but the final entry, with no count of what was dropped.
             analysis_results[report.cve_id] = {
                 "description": report.description,
                 "cvss_score": report.cvss_score,
@@ -192,7 +195,9 @@ def enrich_vulnerability_data(cve_id):
         # Extract relevant information (adjust based on API response structure)
         if data and data.get("resultsPerPage") > 0 and data["vulnerabilities"]: # Safe access and check result size
              vulnerability = data["vulnerabilities"][0]["cve"]
+             # I take the first description whatever language it is in. NVD usually puts English first, but nothing here checks the lang field, so an enriched result can come back in another language with no sign of why.
              description = vulnerability["descriptions"][0]["value"]
+             # Only the 3.1 metrics are read, and only the first entry. A CVE scored only under 4.0 or 3.0 enriches to a severity of None, which prints as a null in the output rather than as a gap the caller is told about.
              cvss_v3_severity = vulnerability.get("metrics", {}).get("cvssMetricV31", [{}])[0].get("cvssData", {}).get("baseSeverity")
 
              enriched_data = {
@@ -246,9 +251,11 @@ def main():
         parser.error("Either --report_file or --cve_id must be provided.")
 
     # Example usage: Analyze vulnerabilities from a report file and a dependency file
+    # The branch shape leaves a hole: a report file with no dependency file matches neither branch when no CVE id is given, and the program ends quietly with exit 0 and no output at all. Nothing tells the caller a second file was needed.
     if args.report_file and args.dependency_file:
         vulnerability_reports = load_vulnerability_reports(args.report_file)
         dependency_graph = load_dependency_graph(args.dependency_file)
+        # An empty report list and a failed load look identical at this point, because the loader returns an empty list for a missing file too. The run then prints nothing and exits 0, so a mistyped path reads exactly like a scan that found no overlap.
         if vulnerability_reports and dependency_graph:
             analysis_results = analyze_vulnerabilities(vulnerability_reports, dependency_graph)
             if args.output:
