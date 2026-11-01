@@ -1,10 +1,10 @@
 import argparse
 import logging
 import json
-import os
 import sys
+import re
+from pathlib import Path
 import requests
-from bs4 import BeautifulSoup
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -89,7 +89,7 @@ def load_vulnerability_reports(report_file):
                         report_data.get('cve_id'),
                         report_data.get('description'),
                         report_data.get('cvss_score'),
-                        report_data.get('affected_dependencies')
+                        report_data.get('affected_dependencies') or []
                     )
                     reports.append(report)
                 except Exception as e:
@@ -97,13 +97,13 @@ def load_vulnerability_reports(report_file):
             return reports
     except FileNotFoundError:
         logging.error(f"Vulnerability report file not found: {report_file}")
-        return []
+        return None
     except json.JSONDecodeError:
         logging.error(f"Invalid JSON format in vulnerability report file: {report_file}")
-        return []
+        return None
     except Exception as e:
         logging.error(f"Error loading vulnerability reports from {report_file}: {e}")
-        return []
+        return None
 
 
 def load_dependency_graph(dependency_file):
@@ -132,6 +132,42 @@ def load_dependency_graph(dependency_file):
         return None
 
 
+
+def _parse_version(value):
+    parts=[]
+    for piece in str(value).strip().split("."):
+        m=re.match(r"(\d+)", piece)
+        if not m: return None
+        parts.append(int(m.group(1)))
+    return tuple(parts) if parts else None
+
+def _version_in_range(version, spec):
+    """Test version against a comma separated range such as '>=1.0,<2.0'. Empty spec matches any."""
+    if not spec: return True
+    v=_parse_version(version)
+    if v is None: return False
+    for part in str(spec).split(","):
+        part=part.strip()
+        if not part: continue
+        m=re.match(r"(>=|<=|==|!=|>|<)\s*(.+)$", part)
+        if not m: return False
+        op, bound = m.group(1), _parse_version(m.group(2))
+        if bound is None: return False
+        n=max(len(v), len(bound)); vv=v+(0,)*(n-len(v)); bb=bound+(0,)*(n-len(bound))
+        cmp=(vv>bb)-(vv<bb)
+        if op==">=" and cmp<0: return False
+        if op=="<=" and cmp>0: return False
+        if op==">" and cmp<=0: return False
+        if op=="<" and cmp>=0: return False
+        if op=="==" and cmp!=0: return False
+        if op=="!=" and cmp==0: return False
+    return True
+
+def _dep_name_range(entry):
+    if isinstance(entry, dict):
+        return entry.get("name") or entry.get("dependency"), entry.get("affected_range") or entry.get("version_range") or entry.get("affected_versions")
+    return entry, None
+
 def analyze_vulnerabilities(vulnerability_reports, dependency_graph):
     """
     Analyzes the vulnerability reports against the dependency graph.
@@ -155,14 +191,20 @@ def analyze_vulnerabilities(vulnerability_reports, dependency_graph):
     analysis_results = {}
     for report in vulnerability_reports:
         vulnerable_components = []
-        for dependency in report.affected_dependencies:
-            # Matching is by name alone. I never compare the version in my graph against any version range, because the reports carry no range field, so a dependency that was patched long ago still lands in the result as long as its name appears in a report. A reader has to do the version judgement by eye from the output.
+        for entry in report.affected_dependencies:
+            dependency, affected_range = _dep_name_range(entry)
             if dependency in dependency_graph.dependencies:
-                vulnerable_components.append({
+                version = dependency_graph.dependencies[dependency].get("version", "unknown")
+                if affected_range and not _version_in_range(version, affected_range):
+                    continue
+                comp={
                     "dependency_name": dependency,
-                    "version": dependency_graph.dependencies[dependency].get("version", "unknown"),
+                    "version": version,
                     "criticality": dependency_graph.dependencies[dependency].get("criticality", "low")
-                })
+                }
+                if affected_range:
+                    comp["affected_range"] = affected_range
+                vulnerable_components.append(comp)
 
         if vulnerable_components:
             # Two reports carrying the same CVE id overwrite each other here, last one wins. A feed that splits one CVE across several entries loses all but the final entry, with no count of what was dropped.
@@ -185,15 +227,17 @@ def enrich_vulnerability_data(cve_id):
     Returns:
         dict: A dictionary containing enriched vulnerability data. Returns None on error.
     """
+    if not cve_id or not re.match(r"^CVE-\d{4}-\d{4,}$", str(cve_id)):
+        logging.error(f"Invalid CVE ID format: {cve_id}")
+        return None
     try:
-        # Example: Fetch data from NVD API (replace with actual API endpoint)
-        nvd_api_url = f"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve_id}"  # Requires API Key - rate limits.  Consider alternatives, like manually maintained DB.
-        response = requests.get(nvd_api_url, timeout=10)  # Add timeout
+        nvd_api_url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+        response = requests.get(nvd_api_url, params={"cveId": cve_id}, timeout=10)
         response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
         data = response.json()
 
         # Extract relevant information (adjust based on API response structure)
-        if data and data.get("resultsPerPage") > 0 and data["vulnerabilities"]: # Safe access and check result size
+        if data and (data.get("resultsPerPage") or 0) > 0 and data.get("vulnerabilities"): # Safe access and check result size
              vulnerability = data["vulnerabilities"][0]["cve"]
              # I take the first description whatever language it is in. NVD usually puts English first, but nothing here checks the lang field, so an enriched result can come back in another language with no sign of why.
              description = vulnerability["descriptions"][0]["value"]
@@ -212,7 +256,7 @@ def enrich_vulnerability_data(cve_id):
     except requests.exceptions.RequestException as e:
         logging.error(f"Error fetching data from NVD API for {cve_id}: {e}")
         return None
-    except (KeyError, IndexError) as e:
+    except (KeyError, IndexError, TypeError, ValueError) as e:
         logging.error(f"Error parsing NVD API response for {cve_id}: {e}")
         return None
     except json.JSONDecodeError as e:
@@ -235,45 +279,53 @@ def output_results(results, output_file):
         with open(output_file, 'w') as f:
             json.dump(results, f, indent=4)
         logging.info(f"Analysis results written to: {output_file}")
+        return True
     except Exception as e:
         logging.error(f"Error writing results to file: {output_file}. Error: {e}")
+        return False
 
 
 def main():
-    """
-    Main function of the vo-VulnDependencyMapper tool.
-    """
     parser = setup_argparse()
     args = parser.parse_args()
-
-    # Input validation: Check if at least one of report_file or cve_id is provided
     if not (args.report_file or args.cve_id):
         parser.error("Either --report_file or --cve_id must be provided.")
-
-    # Example usage: Analyze vulnerabilities from a report file and a dependency file
-    # The branch shape leaves a hole: a report file with no dependency file matches neither branch when no CVE id is given, and the program ends quietly with exit 0 and no output at all. Nothing tells the caller a second file was needed.
+    if args.report_file and not args.dependency_file:
+        parser.error("--dependency_file is required with --report_file: analysis requires both input files.")
+    if args.output and (args.report_file or args.dependency_file):
+        out_resolved = Path(args.output).resolve()
+        for inp in (args.report_file, args.dependency_file):
+            if inp and Path(inp).resolve() == out_resolved:
+                logging.error(f"Refusing to write output over an input file: {args.output}")
+                sys.exit(1)
     if args.report_file and args.dependency_file:
         vulnerability_reports = load_vulnerability_reports(args.report_file)
         dependency_graph = load_dependency_graph(args.dependency_file)
-        # An empty report list and a failed load look identical at this point, because the loader returns an empty list for a missing file too. The run then prints nothing and exits 0, so a mistyped path reads exactly like a scan that found no overlap.
-        if vulnerability_reports and dependency_graph:
-            analysis_results = analyze_vulnerabilities(vulnerability_reports, dependency_graph)
-            if args.output:
-                output_results(analysis_results, args.output)
-            else:
+        if vulnerability_reports is None or dependency_graph is None:
+            sys.exit(1)
+        if not vulnerability_reports:
+            logging.error("No vulnerability reports loaded. Analysis will not run.")
+            sys.exit(1)
+        analysis_results = analyze_vulnerabilities(vulnerability_reports, dependency_graph)
+        if args.output:
+            if not output_results(analysis_results, args.output):
                 print(json.dumps(analysis_results, indent=4))
-
-    # Example usage: Enrich vulnerability data for a single CVE ID
+                logging.error("Failed to write output file; results printed to stdout above.")
+                sys.exit(1)
+        else:
+            print(json.dumps(analysis_results, indent=4))
+        return
     elif args.cve_id:
         if args.enrich:
             enriched_data = enrich_vulnerability_data(args.cve_id)
             if enriched_data:
                 print(json.dumps(enriched_data, indent=4))
             else:
-                logging.warning(f"Failed to enrich data for CVE: {args.cve_id}")
+                logging.error(f"Failed to enrich data for CVE: {args.cve_id}")
+                sys.exit(1)
         else:
             print(f"CVE ID: {args.cve_id}.  Use --enrich to retrieve more info.")
-
+        return
 
 if __name__ == "__main__":
     main()
