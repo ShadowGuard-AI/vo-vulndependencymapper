@@ -81,19 +81,28 @@ def load_vulnerability_reports(report_file):
     try:
         with open(report_file, 'r') as f:
             reports_data = json.load(f)
+            if not isinstance(reports_data, list):
+                logging.error("Vulnerability report file must contain a JSON list of entries.")
+                return None
             reports = []
             for report_data in reports_data:
-                try:
-                    # Every field comes from a get with no default beyond None, and building this object cannot really fail, so the error log below almost never fires. A report entry missing its score or its dependency list loads happily and only breaks, or quietly matches nothing, further down.
-                    report = VulnerabilityReport(
-                        report_data.get('cve_id'),
-                        report_data.get('description'),
-                        report_data.get('cvss_score'),
-                        report_data.get('affected_dependencies') or []
-                    )
-                    reports.append(report)
-                except Exception as e:
-                    logging.error(f"Error creating VulnerabilityReport from data: {report_data}. Error: {e}")
+                if not isinstance(report_data, dict) or not isinstance(report_data.get('cve_id'), str) or not report_data.get('cve_id').strip():
+                    logging.error(f"Skipping report entry with a missing or invalid cve_id: {report_data}")
+                    continue
+                affected = report_data.get('affected_dependencies')
+                if affected is not None and not isinstance(affected, list):
+                    logging.error(f"Skipping report entry {report_data.get('cve_id')}: affected_dependencies must be a list.")
+                    continue
+                score = report_data.get('cvss_score')
+                if score is not None and (isinstance(score, bool) or not isinstance(score, (int, float))):
+                    logging.error(f"Skipping report entry {report_data.get('cve_id')}: cvss_score must be a number.")
+                    continue
+                reports.append(VulnerabilityReport(
+                    report_data.get('cve_id'),
+                    report_data.get('description') or "",
+                    score,
+                    affected or []
+                ))
             return reports
     except FileNotFoundError:
         logging.error(f"Vulnerability report file not found: {report_file}")
@@ -119,7 +128,13 @@ def load_dependency_graph(dependency_file):
     try:
         with open(dependency_file, 'r') as f:
             graph_data = json.load(f)
-            dependencies = graph_data.get('dependencies', {}) # Handle missing dependencies
+            if not isinstance(graph_data, dict):
+                logging.error("Dependency graph file must contain a JSON object.")
+                return None
+            dependencies = graph_data.get('dependencies', {})
+            if not isinstance(dependencies, dict):
+                logging.error("Dependency graph 'dependencies' must be a JSON object.")
+                return None
             return DependencyGraph(graph_data.get('application_name'), dependencies)
     except FileNotFoundError:
         logging.error(f"Dependency graph file not found: {dependency_file}")
@@ -207,12 +222,18 @@ def analyze_vulnerabilities(vulnerability_reports, dependency_graph):
                 vulnerable_components.append(comp)
 
         if vulnerable_components:
-            # Two reports carrying the same CVE id overwrite each other here, last one wins. A feed that splits one CVE across several entries loses all but the final entry, with no count of what was dropped.
-            analysis_results[report.cve_id] = {
-                "description": report.description,
-                "cvss_score": report.cvss_score,
-                "affected_components": vulnerable_components
-            }
+            if report.cve_id in analysis_results:
+                existing = analysis_results[report.cve_id]["affected_components"]
+                seen = {c["dependency_name"] for c in existing}
+                for comp in vulnerable_components:
+                    if comp["dependency_name"] not in seen:
+                        existing.append(comp); seen.add(comp["dependency_name"])
+            else:
+                analysis_results[report.cve_id] = {
+                    "description": report.description,
+                    "cvss_score": report.cvss_score,
+                    "affected_components": vulnerable_components
+                }
 
     return analysis_results
 
@@ -239,10 +260,23 @@ def enrich_vulnerability_data(cve_id):
         # Extract relevant information (adjust based on API response structure)
         if data and (data.get("resultsPerPage") or 0) > 0 and data.get("vulnerabilities"): # Safe access and check result size
              vulnerability = data["vulnerabilities"][0]["cve"]
-             # I take the first description whatever language it is in. NVD usually puts English first, but nothing here checks the lang field, so an enriched result can come back in another language with no sign of why.
-             description = vulnerability["descriptions"][0]["value"]
-             # Only the 3.1 metrics are read, and only the first entry. A CVE scored only under 4.0 or 3.0 enriches to a severity of None, which prints as a null in the output rather than as a gap the caller is told about.
-             cvss_v3_severity = vulnerability.get("metrics", {}).get("cvssMetricV31", [{}])[0].get("cvssData", {}).get("baseSeverity")
+             descriptions = vulnerability.get("descriptions") or []
+             english = [d for d in descriptions if d.get("lang") == "en"]
+             description = (english[0] if english else descriptions[0]).get("value") if descriptions else ""
+             metrics = vulnerability.get("metrics", {})
+             cvss_v3_severity = None
+             for key in ("cvssMetricV31", "cvssMetricV40", "cvssMetricV30"):
+                 entries = metrics.get(key) or []
+                 if entries:
+                     primary = next((e for e in entries if str(e.get("type", "")).lower() == "primary"), entries[0])
+                     cvss_v3_severity = primary.get("cvssData", {}).get("baseSeverity")
+                     if cvss_v3_severity:
+                         break
+             if not cvss_v3_severity:
+                 v2 = metrics.get("cvssMetricV2") or []
+                 if v2:
+                     primary = next((e for e in v2 if str(e.get("type", "")).lower() == "primary"), v2[0])
+                     cvss_v3_severity = primary.get("baseSeverity")
 
              enriched_data = {
                  "description": description,

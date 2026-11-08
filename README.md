@@ -3,7 +3,7 @@ Analyzes vulnerability reports against a dependency graph of applications (for e
 
 Matching: a report entry lists affected dependencies by name. An entry may optionally carry an affected version range, and when it does, the version in the dependency graph is tested against that range before the component is reported as affected. An entry with no range matches on name only.
 
-Report entry shape: each entry has cve_id, description, cvss_score, and affected_dependencies. Each affected dependency is either a plain name string, or an object with a name field and an optional affected_range field holding a comma separated range such as ">=1.0,<2.0" using >=, <=, >, <, ==, or !=. Ranges come from the operator supplied report input; the tool does not invent them.
+Report entry shape: each entry has cve_id, description, cvss_score, and affected_dependencies. Entries with a missing or invalid cve_id, a non-numeric cvss_score, or a non-list affected_dependencies are logged and skipped instead of being loaded. Multiple entries carrying the same CVE id are merged, combining their affected components without duplicates. Enrichment selects the English description when present and reads severity from the first available CVSS version among v3.1, v4.0, v3.0, and v2, preferring the Primary metric entry. Each affected dependency is either a plain name string, or an object with a name field and an optional affected_range field holding a comma separated range such as ">=1.0,<2.0" using >=, <=, >, <, ==, or !=. Ranges come from the operator supplied report input; the tool does not invent them.
 
 ## Install
 `git clone https://github.com/ShadowGuard-AI/vo-vulndependencymapper`
@@ -23,4 +23,4 @@ Analysis requires both input files: --report_file without --dependency_file is a
 - `--enrich`: Enrich vulnerability data from the NVD. Used with --cve_id.
 
 ## License
-Copyright (c) ShadowGuard-AI
+MIT, See LICENSE
